@@ -47,6 +47,8 @@ def main():
             "gpt2-large",
             "gpt2-medium",
             "gpt2",
+            "llama_7B",
+            "llama_13B",
         ],
     )
     aa("--fact_file", default=None)
@@ -64,7 +66,7 @@ def main():
     os.makedirs(pdf_dir, exist_ok=True)
 
     # Half precision to let the 20b model fit.
-    torch_dtype = torch.float16 if "20b" in args.model_name else None
+    torch_dtype = torch.float16 if ("20b" in args.model_name or "llama" in args.mofel_name) else None
 
     mt = ModelAndTokenizer(args.model_name, torch_dtype=torch_dtype)
 
@@ -459,7 +461,7 @@ class ModelAndTokenizer:
     ):
         if tokenizer is None:
             assert model_name is not None
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name, add_bos_token=False, use_fast=False)
         if model is None:
             assert model_name is not None
             model = AutoModelForCausalLM.from_pretrained(
@@ -472,7 +474,7 @@ class ModelAndTokenizer:
         self.layer_names = [
             n
             for n, m in model.named_modules()
-            if (re.match(r"^(transformer|gpt_neox)\.(h|layers)\.\d+$", n))
+            if (re.match(r"^(transformer|gpt_neox|model)\.(h|layers)\.\d+$", n))
         ]
         self.num_layers = len(self.layer_names)
 
@@ -495,6 +497,13 @@ def layername(model, num, kind=None):
         if kind == "attn":
             kind = "attention"
         return f'gpt_neox.layers.{num}{"" if kind is None else "." + kind}'
+    # Update for LLaMa
+    if hasattr(model, "model"):
+        if kind == "embed":
+            return "model.embed_tokens"
+        if kind == "attn":
+            kind = "self_attn"
+        return f'model.layers.{num}{"" if kind is None else "." + kind}'
     assert False, "unknown transformer structure"
 
 
@@ -615,6 +624,8 @@ def decode_tokens(tokenizer, token_array):
 def find_token_range(tokenizer, token_array, substring):
     toks = decode_tokens(tokenizer, token_array)
     whole_string = "".join(toks)
+    substring = "".join(decode_tokens(tokenizer, tokenizer.encode(substring)))
+    # whole_string = tokenizer.decode(token_array)
     char_loc = whole_string.index(substring)
     loc = 0
     tok_start, tok_end = None, None
