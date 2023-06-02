@@ -1,5 +1,7 @@
 import torch
-
+from util import nethook
+from experiments.causal_trace import layername
+from experiments.utils import layername
 
 PRONOUNS = (' she', ' he', ' they')
 PRONOUNS_LLAMA = ('she', 'he', 'they')
@@ -23,7 +25,21 @@ def get_pronoun_probabilities(output, mt, is_batched=False):
     return torch.stack(pron_prob)
 
 
-def pronoun_probs(mt, inp):
-    out = mt.model(**inp)
+def pronoun_probs(mt, inp, project_embeddings=None):
+    if project_embeddings is not None:
+        embed_layername = layername(mt.model, 0, "embed")
+        def patch_embeddings(layer, x):
+            if layer == embed_layername:
+                return x @ project_embeddings
+            else:
+                return x
+        with torch.no_grad(), nethook.TraceDict(
+                mt.model,
+                [embed_layername],
+                edit_output=patch_embeddings,
+        ) as td:
+            out = mt.model(**inp)
+    else:
+        out = mt.model(**inp)
     probs = get_pronoun_probabilities(out.logits, mt, is_batched=False)
     return probs

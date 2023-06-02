@@ -21,6 +21,7 @@ from rome.tok_dataset import (
 from util import nethook
 from util.globals import DATA_DIR
 from util.runningstats import Covariance, tally
+from experiments.utils import layername
 from experiments.gender_trace import get_pronoun_probabilities, pronoun_probs, PRONOUNS_LLAMA
 
 def main():
@@ -55,6 +56,7 @@ def main():
     aa("--output_dir", default="results/{model_name}/causal_trace")
     aa("--noise_level", default="s3", type=parse_noise_rule)
     aa("--replace", default=0, type=int)
+    aa("--project_embeddings", type=str, default=None)
     args = parser.parse_args()
 
     modeldir = f'r{args.replace}_{args.model_name.replace("/", "_")}'
@@ -69,6 +71,12 @@ def main():
     torch_dtype = torch.float16 if ("20b" in args.model_name or "llama" in args.model_name.lower()) else None
 
     mt = ModelAndTokenizer(args.model_name, torch_dtype=torch_dtype)
+
+    if args.project_embeddings is not None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        project_embeddings = numpy.load(args.project_embeddings)
+        project_embeddings = torch.from_numpy(project_embeddings)
+        project_embeddings.to(device)
 
     if args.fact_file is None:
         knowns = KnownsDataset(DATA_DIR)
@@ -113,6 +121,7 @@ def main():
                     noise=noise_level,
                     uniform_noise=uniform_noise,
                     replace=args.replace,
+                    project_embeddings=args.project_embeddings,
                 )
                 numpy_result = {
                     k: v.detach().cpu().numpy() if torch.is_tensor(v) else v
@@ -142,6 +151,7 @@ def trace_with_patch(
     uniform_noise=False,
     replace=False,  # True to replace with instead of add noise
     trace_layers=None,  # List of traced outputs to return
+    project_embeddings=None # INLP projection matrix to project embeddings
 ):
     """
     Runs a single causal trace.  Given a model and a batch input where
@@ -189,6 +199,10 @@ def trace_with_patch(
 
     def patch_rep(x, layer):
         if layer == embed_layername:
+
+            if project_embeddings is not None:
+                x = x @ project_embeddings
+
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
             if tokens_to_mix is not None:
                 b, e = tokens_to_mix
@@ -240,7 +254,8 @@ def trace_with_repatch(
     tokens_to_mix,  # Range of tokens to corrupt (begin, end)
     noise=0.1,  # Level of noise to add
     uniform_noise=False,
-    replace=False
+    replace=False,
+    project_embeddings=None # INLP projection matrix to project embeddings
 ):
     rs = numpy.random.RandomState(1)  # For reproducibility, use pseudorandom noise
     if uniform_noise:
@@ -268,6 +283,8 @@ def trace_with_repatch(
     # Define the model-patching rule.
     def patch_rep(x, layer):
         if layer == embed_layername:
+            if project_embeddings is not None:
+                x = x @ project_embeddings
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
             if tokens_to_mix is not None:
                 b, e = tokens_to_mix
@@ -321,6 +338,7 @@ def calculate_hidden_flow(
     expect=None,
     disable_mlp=False,
     disable_attn=False,
+    project_embeddings=None
 ):
     """
     Runs causal tracing over every token/layer combination in the network
@@ -328,7 +346,7 @@ def calculate_hidden_flow(
     """
     inp = make_inputs(mt.tokenizer, [prompt] * (samples + 1))
     with torch.no_grad():
-        base_score = pronoun_probs(mt, inp)
+        base_score = pronoun_probs(mt, inp, project_embeddings=project_embeddings)
 
     answer_t = None
     e_range = find_token_range(mt.tokenizer, inp["input_ids"][0], subject)
@@ -351,7 +369,8 @@ def calculate_hidden_flow(
             replace=replace,
             token_range=token_range,
             disable_mlp=disable_mlp,
-            disable_attn=disable_attn
+            disable_attn=disable_attn,
+            project_embeddings=project_embeddings
         )
     else:
         differences = trace_important_window(
@@ -366,6 +385,7 @@ def calculate_hidden_flow(
             window=window,
             kind=kind,
             token_range=token_range,
+            project_embeddings=project_embeddings
         )
     differences = differences.detach().cpu()
     return dict(
@@ -394,7 +414,8 @@ def trace_important_states(
     replace=False,
     token_range=None,
     disable_mlp=False,
-    disable_attn=False
+    disable_attn=False,
+    project_embeddings=None
 ):
     ntoks = inp["input_ids"].shape[1]
     table = []
@@ -424,6 +445,7 @@ def trace_important_states(
                     noise=noise,
                     uniform_noise=uniform_noise,
                     replace=replace,
+                    project_embeddings=project_embeddings
                 )
             else:
                 r = trace_with_patch(
@@ -435,6 +457,8 @@ def trace_important_states(
                     noise=noise,
                     uniform_noise=uniform_noise,
                     replace=replace,
+                    project_embeddings=project_embeddings
+
                 )
             row.append(r)
         table.append(torch.stack(row))
@@ -453,6 +477,7 @@ def trace_important_window(
     uniform_noise=False,
     replace=False,
     token_range=None,
+    project_embeddings=None
 ):
     ntoks = inp["input_ids"].shape[1]
     table = []
@@ -477,6 +502,7 @@ def trace_important_window(
                 noise=noise,
                 uniform_noise=uniform_noise,
                 replace=replace,
+                project_embeddings=project_embeddings
             )
             row.append(r)
         table.append(torch.stack(row))
@@ -540,26 +566,26 @@ class ModelAndTokenizer:
             input_embeddings = input_embeddings.mean(dim=0, keepdim=False)
         return input_embeddings
 
-
-def layername(model, num, kind=None):
-    if hasattr(model, "transformer"):
-        if kind == "embed":
-            return "transformer.wte"
-        return f'transformer.h.{num}{"" if kind is None else "." + kind}'
-    if hasattr(model, "gpt_neox"):
-        if kind == "embed":
-            return "gpt_neox.embed_in"
-        if kind == "attn":
-            kind = "attention"
-        return f'gpt_neox.layers.{num}{"" if kind is None else "." + kind}'
-    # Update for LLaMa
-    if hasattr(model, "model"):
-        if kind == "embed":
-            return "model.embed_tokens"
-        if kind == "attn":
-            kind = "self_attn"
-        return f'model.layers.{num}{"" if kind is None else "." + kind}'
-    assert False, "unknown transformer structure"
+#
+# def layername(model, num, kind=None):
+#     if hasattr(model, "transformer"):
+#         if kind == "embed":
+#             return "transformer.wte"
+#         return f'transformer.h.{num}{"" if kind is None else "." + kind}'
+#     if hasattr(model, "gpt_neox"):
+#         if kind == "embed":
+#             return "gpt_neox.embed_in"
+#         if kind == "attn":
+#             kind = "attention"
+#         return f'gpt_neox.layers.{num}{"" if kind is None else "." + kind}'
+#     # Update for LLaMa
+#     if hasattr(model, "model"):
+#         if kind == "embed":
+#             return "model.embed_tokens"
+#         if kind == "attn":
+#             kind = "self_attn"
+#         return f'model.layers.{num}{"" if kind is None else "." + kind}'
+#     assert False, "unknown transformer structure"
 
 
 def guess_subject(prompt):
