@@ -9,7 +9,7 @@ import torch
 from datasets import load_dataset
 from matplotlib import pyplot as plt
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 
 from dsets import KnownsDataset
 from rome.tok_dataset import (
@@ -21,7 +21,7 @@ from rome.tok_dataset import (
 from util import nethook
 from util.globals import DATA_DIR
 from util.runningstats import Covariance, tally
-
+from experiments.gender_trace import get_pronoun_probabilities, pronoun_probs, PRONOUNS_LLAMA
 
 def main():
     parser = argparse.ArgumentParser(description="Causal Tracing")
@@ -66,7 +66,7 @@ def main():
     os.makedirs(pdf_dir, exist_ok=True)
 
     # Half precision to let the 20b model fit.
-    torch_dtype = torch.float16 if ("20b" in args.model_name or "llama" in args.mofel_name) else None
+    torch_dtype = torch.float16 if ("20b" in args.model_name or "llama" in args.model_name.lower()) else None
 
     mt = ModelAndTokenizer(args.model_name, torch_dtype=torch_dtype)
 
@@ -133,7 +133,7 @@ def main():
 
 
 def trace_with_patch(
-    model,  # The model
+    mt,  # The model and tokenizer
     inp,  # A set of inputs
     states_to_patch,  # A list of (token index, layername) triples to restore
     answers_t,  # Answer probabilities to collect
@@ -176,7 +176,7 @@ def trace_with_patch(
     for t, l in states_to_patch:
         patch_spec[l].append(t)
 
-    embed_layername = layername(model, 0, "embed")
+    embed_layername = layername(mt.model, 0, "embed")
 
     def untuple(x):
         return x[0] if isinstance(x, tuple) else x
@@ -212,14 +212,14 @@ def trace_with_patch(
     # With the patching rules defined, run the patched model in inference.
     additional_layers = [] if trace_layers is None else trace_layers
     with torch.no_grad(), nethook.TraceDict(
-        model,
+        mt.model,
         [embed_layername] + list(patch_spec.keys()) + additional_layers,
         edit_output=patch_rep,
     ) as td:
-        outputs_exp = model(**inp)
+        outputs_exp = mt.model(**inp)
 
-    # We report softmax probabilities for the answers_t token predictions of interest.
-    probs = torch.softmax(outputs_exp.logits[1:, -1, :], dim=1).mean(dim=0)[answers_t]
+    # We report softmax probabilities for three gendered probabilites:
+    probs = get_pronoun_probabilities(outputs_exp.logits, mt, is_batched=True)
 
     # If tracing all layers, collect all activations together to return.
     if trace_layers is not None:
@@ -232,7 +232,7 @@ def trace_with_patch(
 
 
 def trace_with_repatch(
-    model,  # The model
+    mt,  # The modelAndTokenizer
     inp,  # A set of inputs
     states_to_patch,  # A list of (token index, layername) triples to restore
     states_to_unpatch,  # A list of (token index, layername) triples to re-randomize
@@ -240,6 +240,7 @@ def trace_with_repatch(
     tokens_to_mix,  # Range of tokens to corrupt (begin, end)
     noise=0.1,  # Level of noise to add
     uniform_noise=False,
+    replace=False
 ):
     rs = numpy.random.RandomState(1)  # For reproducibility, use pseudorandom noise
     if uniform_noise:
@@ -253,20 +254,30 @@ def trace_with_repatch(
     for t, l in states_to_unpatch:
         unpatch_spec[l].append(t)
 
-    embed_layername = layername(model, 0, "embed")
+    embed_layername = layername(mt.model, 0, "embed")
 
     def untuple(x):
         return x[0] if isinstance(x, tuple) else x
 
+    # Define the model-patching rule.
+    if isinstance(noise, float):
+        noise_fn = lambda x: noise * x
+    else:
+        noise_fn = noise
+        
     # Define the model-patching rule.
     def patch_rep(x, layer):
         if layer == embed_layername:
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
             if tokens_to_mix is not None:
                 b, e = tokens_to_mix
-                x[1:, b:e] += noise * torch.from_numpy(
-                    prng(x.shape[0] - 1, e - b, x.shape[2])
+                noise_data = noise_fn(
+                    torch.from_numpy(prng(x.shape[0] - 1, e - b, x.shape[2]))
                 ).to(x.device)
+                if replace:
+                    x[1:, b:e] = noise_data
+                else:
+                    x[1:, b:e] += noise_data
             return x
         if first_pass or (layer not in patch_spec and layer not in unpatch_spec):
             return x
@@ -282,16 +293,16 @@ def trace_with_repatch(
     # With the patching rules defined, run the patched model in inference.
     for first_pass in [True, False] if states_to_unpatch else [False]:
         with torch.no_grad(), nethook.TraceDict(
-            model,
+            mt.model,
             [embed_layername] + list(patch_spec.keys()) + list(unpatch_spec.keys()),
             edit_output=patch_rep,
         ) as td:
-            outputs_exp = model(**inp)
+            outputs_exp = mt.model(**inp)
             if first_pass:
                 first_pass_trace = td
 
     # We report softmax probabilities for the answers_t token predictions of interest.
-    probs = torch.softmax(outputs_exp.logits[1:, -1, :], dim=1).mean(dim=0)[answers_t]
+    probs = get_pronoun_probabilities(outputs_exp.logits, mt, is_batched=True)
 
     return probs
 
@@ -308,6 +319,8 @@ def calculate_hidden_flow(
     window=10,
     kind=None,
     expect=None,
+    disable_mlp=False,
+    disable_attn=False,
 ):
     """
     Runs causal tracing over every token/layer combination in the network
@@ -315,21 +328,20 @@ def calculate_hidden_flow(
     """
     inp = make_inputs(mt.tokenizer, [prompt] * (samples + 1))
     with torch.no_grad():
-        answer_t, base_score = [d[0] for d in predict_from_input(mt.model, inp)]
-    [answer] = decode_tokens(mt.tokenizer, [answer_t])
-    if expect is not None and answer.strip() != expect:
-        return dict(correct_prediction=False)
+        base_score = pronoun_probs(mt, inp)
+
+    answer_t = None
     e_range = find_token_range(mt.tokenizer, inp["input_ids"][0], subject)
     if token_range == "subject_last":
         token_range = [e_range[1] - 1]
     elif token_range is not None:
         raise ValueError(f"Unknown token_range: {token_range}")
     low_score = trace_with_patch(
-        mt.model, inp, [], answer_t, e_range, noise=noise, uniform_noise=uniform_noise
-    ).item()
+        mt, inp, [], answer_t, e_range, noise=noise, uniform_noise=uniform_noise
+    )
     if not kind:
         differences = trace_important_states(
-            mt.model,
+            mt,
             mt.num_layers,
             inp,
             e_range,
@@ -338,10 +350,12 @@ def calculate_hidden_flow(
             uniform_noise=uniform_noise,
             replace=replace,
             token_range=token_range,
+            disable_mlp=disable_mlp,
+            disable_attn=disable_attn
         )
     else:
         differences = trace_important_window(
-            mt.model,
+            mt,
             mt.num_layers,
             inp,
             e_range,
@@ -361,7 +375,8 @@ def calculate_hidden_flow(
         input_ids=inp["input_ids"][0],
         input_tokens=decode_tokens(mt.tokenizer, inp["input_ids"][0]),
         subject_range=e_range,
-        answer=answer,
+        # answer=answer,
+        answer=PRONOUNS_LLAMA,
         window=window,
         correct_prediction=True,
         kind=kind or "",
@@ -369,7 +384,7 @@ def calculate_hidden_flow(
 
 
 def trace_important_states(
-    model,
+    mt,
     num_layers,
     inp,
     e_range,
@@ -378,6 +393,8 @@ def trace_important_states(
     uniform_noise=False,
     replace=False,
     token_range=None,
+    disable_mlp=False,
+    disable_attn=False
 ):
     ntoks = inp["input_ids"].shape[1]
     table = []
@@ -385,25 +402,47 @@ def trace_important_states(
     if token_range is None:
         token_range = range(ntoks)
     for tnum in token_range:
+        zero_lyrs = []
+        if disable_mlp:
+            zero_lyrs = [
+                (tnum, layername(mt.model, L, "mlp")) for L in range(0, num_layers)
+            ]
+        if disable_attn:
+            zero_lyrs += [
+                (tnum, layername(mt.model, L, "attn")) for L in range(0, num_layers)
+            ]
         row = []
-        for layer in range(num_layers):
-            r = trace_with_patch(
-                model,
-                inp,
-                [(tnum, layername(model, layer))],
-                answer_t,
-                tokens_to_mix=e_range,
-                noise=noise,
-                uniform_noise=uniform_noise,
-                replace=replace,
-            )
+        for layer in range(0, num_layers):
+            if disable_mlp or disable_attn:
+                r = trace_with_repatch(
+                    mt,
+                    inp,
+                    [(tnum, layername(mt.model, layer))],
+                    zero_lyrs,
+                    answer_t,
+                    tokens_to_mix=e_range,
+                    noise=noise,
+                    uniform_noise=uniform_noise,
+                    replace=replace,
+                )
+            else:
+                r = trace_with_patch(
+                    mt,
+                    inp,
+                    [(tnum, layername(mt.model, layer))],
+                    answer_t,
+                    tokens_to_mix=e_range,
+                    noise=noise,
+                    uniform_noise=uniform_noise,
+                    replace=replace,
+                )
             row.append(r)
         table.append(torch.stack(row))
     return torch.stack(table)
 
 
 def trace_important_window(
-    model,
+    mt,
     num_layers,
     inp,
     e_range,
@@ -422,15 +461,15 @@ def trace_important_window(
         token_range = range(ntoks)
     for tnum in token_range:
         row = []
-        for layer in range(num_layers):
+        for layer in range(0, num_layers):
             layerlist = [
-                (tnum, layername(model, L, kind))
+                (tnum, layername(mt.model, L, kind))
                 for L in range(
                     max(0, layer - window // 2), min(num_layers, layer - (-window // 2))
                 )
             ]
             r = trace_with_patch(
-                model,
+                mt,
                 inp,
                 layerlist,
                 answer_t,
@@ -468,7 +507,8 @@ class ModelAndTokenizer:
                 model_name, low_cpu_mem_usage=low_cpu_mem_usage, torch_dtype=torch_dtype
             )
             nethook.set_requires_grad(False, model)
-            model.eval().cuda()
+            if torch.cuda.is_available():
+                model.eval().cuda()
         self.tokenizer = tokenizer
         self.model = model
         self.layer_names = [
@@ -484,6 +524,21 @@ class ModelAndTokenizer:
             f"[{self.num_layers} layers], "
             f"tokenizer: {type(self.tokenizer).__name__})"
         )
+    
+    def get_input_representations(self, prompt, average=True):
+        """
+        Get the input representations for a given prompt
+        :param prompt: textual input
+        :param average: whether to average embeddings across all tokens
+        :return: torch.Tensor of shape (embedding_size,) or (num_tokens, embedding_size)
+        """
+        input_ids = self.tokenizer.encode(prompt)
+        
+        # get embeddings at given token positions
+        input_embeddings = self.model.get_input_embeddings().weight[input_ids, :]
+        if average:
+            input_embeddings = input_embeddings.mean(dim=0, keepdim=False)
+        return input_embeddings
 
 
 def layername(model, num, kind=None):
@@ -599,6 +654,7 @@ def plot_all_flow(mt, prompt, subject=None):
 
 # Utilities for dealing with tokens
 def make_inputs(tokenizer, prompts, device="cuda"):
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
     token_lists = [tokenizer.encode(p) for p in prompts]
     maxlen = max(len(t) for t in token_lists)
     if "[PAD]" in tokenizer.all_special_tokens:
@@ -606,11 +662,11 @@ def make_inputs(tokenizer, prompts, device="cuda"):
     else:
         pad_id = 0
     input_ids = [[pad_id] * (maxlen - len(t)) + t for t in token_lists]
-    # position_ids = [[0] * (maxlen - len(t)) + list(range(len(t))) for t in token_lists]
+    position_ids = [[0] * (maxlen - len(t)) + list(range(len(t))) for t in token_lists]
     attention_mask = [[0] * (maxlen - len(t)) + [1] * len(t) for t in token_lists]
     return dict(
         input_ids=torch.tensor(input_ids).to(device),
-        #    position_ids=torch.tensor(position_ids).to(device),
+        position_ids=torch.tensor(position_ids).to(device),
         attention_mask=torch.tensor(attention_mask).to(device),
     )
 
