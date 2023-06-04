@@ -1,7 +1,7 @@
 import torch
 from util import nethook
 from experiments.causal_trace import layername
-from experiments.utils import layername
+from experiments.utils import layername, project_representation
 
 PRONOUNS = (' she', ' he', ' they')
 PRONOUNS_LLAMA = ('she', 'he', 'they')
@@ -30,7 +30,7 @@ def pronoun_probs(mt, inp, project_embeddings=None):
         embed_layername = layername(mt.model, 0, "embed")
         def patch_embeddings(layer, x):
             if layer == embed_layername:
-                return x @ project_embeddings
+                return project_representation(x, **project_embeddings)
             else:
                 return x
         with torch.no_grad(), nethook.TraceDict(

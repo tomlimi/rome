@@ -1,4 +1,13 @@
 
+def project_representation(x, P, mu, s):
+    """
+    Projects embeddings into a lower dimensional space.
+    """
+    x = (x - mu) / s
+    x = x @ P
+    x = x * s + mu
+    return x
+
 
 def layername(model, num, kind=None):
     if hasattr(model, "transformer"):

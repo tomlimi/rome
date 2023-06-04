@@ -21,7 +21,7 @@ from rome.tok_dataset import (
 from util import nethook
 from util.globals import DATA_DIR
 from util.runningstats import Covariance, tally
-from experiments.utils import layername
+from experiments.utils import layername, project_representation
 from experiments.gender_trace import get_pronoun_probabilities, pronoun_probs, PRONOUNS_LLAMA
 
 def main():
@@ -201,7 +201,7 @@ def trace_with_patch(
         if layer == embed_layername:
 
             if project_embeddings is not None:
-                x = x @ project_embeddings
+                x = project_representation(x, **project_embeddings)
 
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
             if tokens_to_mix is not None:
@@ -284,7 +284,7 @@ def trace_with_repatch(
     def patch_rep(x, layer):
         if layer == embed_layername:
             if project_embeddings is not None:
-                x = x @ project_embeddings
+                x = project_representation(x, **project_embeddings)
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
             if tokens_to_mix is not None:
                 b, e = tokens_to_mix
