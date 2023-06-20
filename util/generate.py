@@ -99,13 +99,14 @@ def generate_fast(
     # `cur_context` is used to define the range of inputs that are not yet
     # stored in `past_key_values`. At each step, we are generating the
     # next token for the index at `cur_context.stop + 1`.
+    cur_context: slice
     past_key_values, cur_context = None, slice(0, attention_mask.sum(1).min().item())
 
     with torch.no_grad():
         while input_ids.size(1) < max_out_len:  # while not exceeding max output length
             model_out = model(
                 input_ids=input_ids[:, cur_context],
-                attention_mask=attention_mask[:, cur_context],
+                attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=True,
             )

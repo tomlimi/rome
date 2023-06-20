@@ -170,6 +170,7 @@ def get_context_templates(model, tok, length_params):
                 ),
                 [],
             )
+            if '{' not in x and '}' not in x
         ]
 
         print(f"Cached context templates {CONTEXT_TEMPLATES_CACHE}")

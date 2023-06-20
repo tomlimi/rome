@@ -49,7 +49,7 @@ def get_inv_cov(
             precision=mom2_dtype,
         )
         inv_mom2_cache[key] = torch.inverse(
-            stat.mom2.moment().to("cuda")
+            stat.mom2.moment().to("cuda" if torch.cuda.is_available() else "cpu")
         ).float()  # Cast back to float32
 
     return inv_mom2_cache[key]

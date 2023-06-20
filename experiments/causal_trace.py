@@ -301,8 +301,11 @@ def trace_with_repatch(
         # If this layer is in the patch_spec, restore the uncorrupted hidden state
         # for selected tokens.
         h = untuple(x)
-        for t in patch_spec.get(layer, []):
-            h[1:, t] = h[0, t]
+        # patch overrides unpatch
+        if layer in patch_spec:
+            for t in patch_spec.get(layer, []):
+                h[1:, t] = h[0, t]
+            return x
         for t in unpatch_spec.get(layer, []):
             h[1:, t] = untuple(first_pass_trace[layer].output)[1:, t]
         return x
@@ -385,6 +388,8 @@ def calculate_hidden_flow(
             window=window,
             kind=kind,
             token_range=token_range,
+            disable_mlp=disable_mlp,
+            disable_attn=disable_attn,
             project_embeddings=project_embeddings
         )
     differences = differences.detach().cpu()
@@ -425,12 +430,19 @@ def trace_important_states(
     for tnum in token_range:
         zero_lyrs = []
         if disable_mlp:
+            # zero_lyrs = [
+            #     (tnum, layername(mt.model, L, "mlp")) for L in range(0, num_layers)
+            # ]
+            # disable on all tokens
             zero_lyrs = [
-                (tnum, layername(mt.model, L, "mlp")) for L in range(0, num_layers)
+                (t, layername(mt.model, L, "mlp")) for t in token_range for L in range(0, num_layers)
             ]
         if disable_attn:
+            # zero_lyrs += [
+            #     (tnum, layername(mt.model, L, "attn")) for L in range(0, num_layers)
+            # ]
             zero_lyrs += [
-                (tnum, layername(mt.model, L, "attn")) for L in range(0, num_layers)
+                (t, layername(mt.model, L, "attn")) for t in token_range for L in range(0, num_layers)
             ]
         row = []
         for layer in range(0, num_layers):
@@ -476,6 +488,8 @@ def trace_important_window(
     noise=0.1,
     uniform_noise=False,
     replace=False,
+    disable_mlp=False,
+    disable_attn=False,
     token_range=None,
     project_embeddings=None
 ):
@@ -485,6 +499,15 @@ def trace_important_window(
     if token_range is None:
         token_range = range(ntoks)
     for tnum in token_range:
+        zero_lyrs = []
+        if disable_mlp:
+            zero_lyrs = [
+                (t, layername(mt.model, L, "mlp")) for t in token_range for L in range(0, num_layers)
+            ]
+        if disable_attn:
+            zero_lyrs += [
+                (t, layername(mt.model, L, "attn")) for t in token_range for L in range(0, num_layers)
+            ]
         row = []
         for layer in range(0, num_layers):
             layerlist = [
@@ -493,17 +516,31 @@ def trace_important_window(
                     max(0, layer - window // 2), min(num_layers, layer - (-window // 2))
                 )
             ]
-            r = trace_with_patch(
-                mt,
-                inp,
-                layerlist,
-                answer_t,
-                tokens_to_mix=e_range,
-                noise=noise,
-                uniform_noise=uniform_noise,
-                replace=replace,
-                project_embeddings=project_embeddings
-            )
+            if disable_mlp or disable_attn:
+                r = trace_with_repatch(
+                    mt,
+                    inp,
+                    layerlist,
+                    zero_lyrs,
+                    answer_t,
+                    tokens_to_mix=e_range,
+                    noise=noise,
+                    uniform_noise=uniform_noise,
+                    replace=replace,
+                    project_embeddings=project_embeddings
+                )
+            else:
+                r = trace_with_patch(
+                    mt,
+                    inp,
+                    layerlist,
+                    answer_t,
+                    tokens_to_mix=e_range,
+                    noise=noise,
+                    uniform_noise=uniform_noise,
+                    replace=replace,
+                    project_embeddings=project_embeddings
+                )
             row.append(r)
         table.append(torch.stack(row))
     return torch.stack(table)
@@ -760,7 +797,7 @@ def get_embedding_cov(mt):
             dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name],
         )
         try:
-            maxlen = model.config.n_positions
+            maxlen = model.config.max_position_embeddings
         except:
             maxlen = 100  # Hack due to missing setting in GPT2-NeoX.
         return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
