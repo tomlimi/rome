@@ -566,12 +566,20 @@ class ModelAndTokenizer:
             tokenizer = AutoTokenizer.from_pretrained(model_name, add_bos_token=False, use_fast=False)
         if model is None:
             assert model_name is not None
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name, low_cpu_mem_usage=low_cpu_mem_usage, torch_dtype=torch_dtype
-            )
+            if torch.cuda.device_count() <= 1:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name, low_cpu_mem_usage=low_cpu_mem_usage, torch_dtype=torch_dtype
+                )
+                if torch.cuda.is_available():
+                    model = model.eval().cuda()
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name, low_cpu_mem_usage=True, torch_dtype=torch_dtype, device_map="auto"
+                )
+                model = model.eval()
+
             nethook.set_requires_grad(False, model)
-            if torch.cuda.is_available():
-                model.eval().cuda()
+
         self.tokenizer = tokenizer
         self.model = model
         self.layer_names = [
