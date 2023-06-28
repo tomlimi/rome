@@ -50,8 +50,12 @@ def get_inv_cov(
         )
         inv_mom2_cache[key] = torch.inverse(
             stat.mom2.moment().to("cuda" if torch.cuda.is_available() else "cpu")
-        ).float()  # Cast back to float32
+        )
 
+        if torch.cuda.is_available():
+            inv_mom2_cache[key] = inv_mom2_cache[key].half()  # Cast to float16
+        else:
+            inv_mom2_cache[key] = inv_mom2_cache[key].float()  # Cast to float32
     return inv_mom2_cache[key]
 
 
@@ -106,6 +110,10 @@ def compute_u(
 
     # Apply inverse second moment adjustment
     u = cur_repr
+
+    # if torch.cuda.is_available():
+    #     u.to("cuda")
+    #     u = u.float()
     if hparams.mom2_adjustment:
         u = get_inv_cov(
             model,

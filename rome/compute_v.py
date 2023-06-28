@@ -166,6 +166,10 @@ def compute_v(
 
     target = target_init + delta
 
+    if torch.cuda.is_available():
+        target.to("cuda")
+        target = target.half()
+
     # Retrieve cur_input, the current input to the 2nd MLP layer, and
     # cur_output, the original output of the 2nd MLP layer.
     cur_input, cur_output = get_module_input_output_at_word(
