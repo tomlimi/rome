@@ -9,7 +9,7 @@ from rome import repr_tools
 from util.globals import *
 
 from .layer_stats import layer_stats
-from .rome_hparams import ROMEHyperParams
+from .rome_hparams import ROMEHyperParams, DAMAHyperParams
 
 # Cache variables
 inv_mom2_cache = {}
@@ -63,7 +63,7 @@ def compute_u(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     request: Dict,
-    hparams: ROMEHyperParams,
+    hparams: Union[ROMEHyperParams, DAMAHyperParams],
     layer: int,
     context_templates: List[str],
 ) -> torch.Tensor:
