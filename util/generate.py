@@ -2,7 +2,7 @@ import unicodedata
 from typing import List, Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizerFast
 
 from util.logit_lens import LogitLens
 
@@ -89,6 +89,9 @@ def generate_fast(
 
     # Unroll prompts and tokenize
     inp = [prompt for prompt in prompts for _ in range(n_gen_per_prompt)]
+    if type(tok) is LlamaTokenizerFast and not tok.add_bos_token:
+        inp = [prompt if prompt.startswith(tok.bos_token)
+               else f"{tok.bos_token} {prompt}" for prompt in inp]
     inp_tok = tok(inp, padding=True, return_tensors="pt").to(
         next(model.parameters()).device
     )
@@ -99,14 +102,14 @@ def generate_fast(
     # `cur_context` is used to define the range of inputs that are not yet
     # stored in `past_key_values`. At each step, we are generating the
     # next token for the index at `cur_context.stop + 1`.
-    cur_context: slice
-    past_key_values, cur_context = None, slice(0, attention_mask.sum(1).min().item())
-
+    past_key_values =  None
+    cur_context = slice(0, attention_mask.sum(1).min().item())
+    whole_context = slice(0, attention_mask.sum(1).min().item())
     with torch.no_grad():
         while input_ids.size(1) < max_out_len:  # while not exceeding max output length
             model_out = model(
                 input_ids=input_ids[:, cur_context],
-                attention_mask=attention_mask,
+                attention_mask=attention_mask[:,whole_context],
                 past_key_values=past_key_values,
                 use_cache=True,
             )
@@ -146,12 +149,13 @@ def generate_fast(
                     attention_mask[i][new_idx] = 1
 
             cur_context = slice(cur_context.stop, cur_context.stop + 1)
+            whole_context = slice(0, whole_context.stop + 1)
 
     txt = [tok.decode(x) for x in input_ids.detach().cpu().numpy().tolist()]
     txt = [
         unicodedata.normalize("NFKD", x)
         .replace("\n\n", " ")
-        .replace("<|endoftext|>", "")
+        .replace("</s>", "")
         for x in txt
     ]
 

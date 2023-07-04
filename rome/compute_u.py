@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -123,6 +123,7 @@ def compute_u(
             hparams.mom2_n_samples,
             hparams.mom2_dtype,
         ) @ u.unsqueeze(1)
+        # TODO: whitening variance of the vector u, is it needed?
         u = u.squeeze()
 
     return u / u.norm()

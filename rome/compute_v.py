@@ -34,9 +34,9 @@ def compute_v(
 
     # Compile list of rewriting and KL x/y pairs
     rewriting_prompts, kl_prompts = [
-        context.format(request["prompt"]) + tok.decode(target_ids[:-1])
+        context.format(request["prompt"])
         for context in context_templates
-    ], ["{} is a"]
+    ], ["<s> {} is a"]
     all_prompts = rewriting_prompts + kl_prompts
 
     input_tok = tok(
