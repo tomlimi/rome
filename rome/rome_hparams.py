@@ -31,6 +31,7 @@ class ROMEHyperParams(HyperParams):
     mom2_n_samples: int
     mom2_dtype: str
 
+@dataclass
 class DAMAHyperParams(HyperParams):
     # Method
     layers: List[int]

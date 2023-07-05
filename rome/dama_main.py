@@ -1,3 +1,4 @@
+import copy
 from copy import deepcopy
 from typing import Dict, List, Tuple
 
@@ -5,7 +6,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from util import nethook
-from util.generate import generate_fast
 import numpy as np
 import scipy
 from sklearn.cross_decomposition import PLSRegression
@@ -15,17 +15,25 @@ from .compute_v_dama import compute_v_dama
 from .rome_hparams import DAMAHyperParams
 from .rome_main import get_context_templates
 
+class AddBias(torch.nn.Module):
+    def __init__(self, bias):
+        super().__init__()
+        self.bias = bias
+
+    def forward(self, x):
+        return x + self.bias
 
 
-def apply_dama_on_module(module, P, mu_in, mu_out):
-
+def apply_dama_on_module(old_mlp, P, mu_in, mu_out):
 
     # Apply DAME on the module
-    new_module = deepcopy(module)
+    new_mlp= copy.copy(old_mlp)
 
-    # TODO - apply DAME on the module
-    raise NotImplementedError
-    return new_module
+    new_mlp.weight = torch.nn.Parameter(old_mlp.weight @ P)
+    in_bias = AddBias(-mu_in)
+    out_bias = AddBias(mu_out)
+
+    return torch.nn.Sequential(in_bias, new_mlp, out_bias)
 
 # TODO - INLP functions store together with INLP code
 def get_rowspace_projection(W: np.ndarray) -> np.ndarray:
@@ -44,24 +52,7 @@ def get_rowspace_projection(W: np.ndarray) -> np.ndarray:
 
     return P_W
 
-# TODO: this is just for refernce shouldn't be used here
-def project_with_pls(x: np.ndarray, P: np.ndarray, mu: np.ndarray, s: np.ndarray) -> np.ndarray:
-    """
-    :param x: ndarray, input vector
-    :param P: ndarray, projection matrix
-    :param mu: ndarray, mean of training data
-    :param s: ndarray, std of training data
-    :return: ndarray, projected vector
-    """
-    # TODO: are operations involving s necessary?
-    x = (x - mu) / s
-    x = np.dot(x, P)
-    x = (x * s) + mu
-
-    return x
-
-
-def apply_dama(
+def apply_dama_to_model(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     requests: List[Dict],
@@ -94,9 +85,9 @@ def apply_dama(
             new_module = apply_dama_on_module(orig_module, P, mu_in, mu_out)
 
             if return_orig_module and m_name not in module_copy:
-                module_copy[m_name] = orig_module.detach().clone()
+                module_copy[m_name] = deepcopy(orig_module)
 
-            nethook.set_module(model, m_name, new_module)
+            nethook.replace_module(model, m_name, new_module)
 
         print(f"New weights successfully inserted into {list(projections.keys())}")
 
@@ -113,7 +104,7 @@ def execute_dama(
     # # Retrieve weights that user desires to change
     weights = {
         f"{hparams.rewrite_module_tmp.format(layer)}": nethook.get_parameter(
-            model, f"{hparams.rewrite_module_tmp.format(layer)}"
+            model, f"{hparams.rewrite_module_tmp.format(layer)}.weight"
         )
         for layer in hparams.layers
     }
@@ -156,43 +147,51 @@ def execute_dama(
             print("Right vector shape:", right_contrast_vector.shape)
             r_vec_list.append(right_contrast_vector)
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         with torch.no_grad():
             module_name = f"{hparams.rewrite_module_tmp.format(layer)}"
-            # detach the weights from the grapha and convert to numpy
-            U = torch.stack(l_vec_list, dim=0).cpu().numpy()
-            V = torch.stack(r_vec_list, dim=0).cpu().numpy()
+            # detach the weights from the graph and convert to numpy (float32)
+            U = torch.stack(l_vec_list, dim=0).detach().cpu().numpy().astype(np.float32)
+            V = torch.stack(r_vec_list, dim=0).detach().cpu().numpy().astype(np.float32)
 
-            W = weights[f"{hparams.rewrite_module_tmp.format(layer)}"].cpu().numpy()
+            W = weights[module_name].detach().cpu().numpy().astype(np.float32)
 
-            u_dim = U.shape[1]
-            # multiply V by pseudo inverse of W
-            U_hat = np.matmul(V, np.linalg.pinv(W))
+        u_dim = U.shape[1]
+        # multiply V by pseudo inverse of W
+        U_hat = np.matmul(V, np.linalg.pinv(W).T)
 
 
-            # compute PLS mapping between U and U_hat
-            pls = PLSRegression(n_components=hparams.nullspace_dimension, scale=False)
-            pls.fit(U, U_hat)
+        # compute PLS mapping between U and U_hat
+        print("Computing PLS mapping...")
+        pls = PLSRegression(n_components=hparams.nullspace_dimension, scale=False)
+        pls.fit(U, U_hat)
 
-            B = pls.x_weights_[:,:hparams.projection_components] # not needed but maybe useful to get some statistics
-            P = np.eye(u_dim, u_dim) - get_rowspace_projection(B.T)
-            # TODO: maybe use global statistics to compute mu_s
-            mu_in = pls._x_mean
-            mu_out = W @ pls._x_mean
+        print("Computing nullspace projection...")
+        B = pls.x_weights_[:,:hparams.nullspace_dimension] # not needed but maybe useful to get some statistics
+        P = np.eye(u_dim, u_dim) - get_rowspace_projection(B.T)
 
-            # save as tensors
-            if torch.cuda.is_available():
-                P = torch.tensor(P, dtype=torch.float16, device='cuda')
-                mu_in = torch.tensor(mu_in, dtype=torch.float16, device='cuda')
-                mu_out = torch.tensor(mu_out, dtype=torch.float16, device='cuda')
-            else:
-                P = torch.tensor(P, dtype=torch.float32, device='cpu')
-                mu_in = torch.tensor(mu_in, dtype=torch.float32, device='cpu')
-                mu_out = torch.tensor(mu_out, dtype=torch.float32, device='cpu')
+        # TODO: maybe use global statistics to compute mu_s
+        mu_in = pls._x_mean
+        mu_out = W @ pls._x_mean
 
-            projections[module_name] = (P, mu_in, mu_out)
+        # save as tensors
+        if torch.cuda.is_available():
+            P = torch.tensor(P, dtype=torch.float16, device='cuda')
+            mu_in = torch.tensor(mu_in, dtype=torch.float16, device='cuda')
+            mu_out = torch.tensor(mu_out, dtype=torch.float16, device='cuda')
+        else:
+            P = torch.tensor(P, dtype=torch.float32, device='cpu')
+            mu_in = torch.tensor(mu_in, dtype=torch.float32, device='cpu')
+            mu_out = torch.tensor(mu_out, dtype=torch.float32, device='cpu')
+
+        projections[module_name] = (P, mu_in, mu_out)
 
         print(f"Projections successfully computed for layer {list(projections.keys())}")
+        print(f"Projection values: {P}")
+
+    # TODO: save projections
     return projections
 
 
