@@ -176,6 +176,15 @@ def execute_dama(
         mu_in = pls._x_mean
         mu_out = W @ pls._x_mean
 
+        print(f"Projections successfully computed for layer {list(projections.keys())}")
+        print(f"Projection values: {P}")
+
+        ## Diff from identity matrix
+        print(f"Diff from identity matrix: {np.linalg.norm(P - np.eye(u_dim, u_dim))}")
+        ### mu vectors
+        print(f"Input centralization vector (mu_in): {mu_in}")
+        print(f"Output de-centralization vector (mu_out): {mu_out}")
+
         # save as tensors
         if torch.cuda.is_available():
             P = torch.tensor(P, dtype=torch.float16, device='cuda')
@@ -188,8 +197,6 @@ def execute_dama(
 
         projections[module_name] = (P, mu_in, mu_out)
 
-        print(f"Projections successfully computed for layer {list(projections.keys())}")
-        print(f"Projection values: {P}")
 
     # TODO: save projections
     return projections
