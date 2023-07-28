@@ -14,8 +14,8 @@ def generate_interactive(
     max_out_len: int = 200,
     compare_against: Optional[AutoModelForCausalLM] = None,
     use_logit_lens: bool = False,
-    layer_module_tmp: str = "transformer.h.{}",
-    ln_f_module: str = "transformer.ln_f",
+    layer_module_tmp: str = "model.layers.{}",
+    ln_f_module: str = "model.norm",
     lm_head_module: str = "lm_head",
 ):
     """
@@ -56,18 +56,16 @@ def generate_interactive(
             )
 
         if use_logit_lens:
-            inp_prompt = tok([prompt], padding=True, return_tensors="pt").to(
-                next(model.parameters()).device
-            )
+            # inp_prompt = tok([prompt], padding=True, return_tensors="pt").to(
+            #     next(model.parameters()).device
+            # )
 
-            with llens_gen:
-                model(**inp_prompt)
+            llens_gen(prompt)
             print("\n--- Argument Model Logit Lens ---")
             llens_gen.pprint()
 
             if compare_against:
-                with llens_vanilla:
-                    compare_against(**inp_prompt)
+                llens_vanilla(prompt)
                 print("--- Baseline Model Logit Lens ---")
                 llens_vanilla.pprint()
 
