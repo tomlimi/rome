@@ -1,6 +1,6 @@
 import copy
 from copy import deepcopy
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -63,7 +63,7 @@ def apply_dama_to_model(
     hparams: DAMAHyperParams,
     copy=False,
     return_orig_module=False,
-) -> Tuple[AutoModelForCausalLM, List[str]]:
+) -> tuple[AutoModelForCausalLM | AutoModelForCausalLM, dict[str, Any]]:
 
     """
     Returns a model with the desired changes.
