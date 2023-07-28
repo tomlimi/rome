@@ -15,6 +15,8 @@ from .compute_v_dama import compute_v_dama
 from .rome_hparams import DAMAHyperParams
 from .rome_main import get_context_templates
 
+from tqdm import tqdm
+
 class AddBias(torch.nn.Module):
     def __init__(self, bias):
         super().__init__()
@@ -36,19 +38,21 @@ def apply_dama_on_module(old_mlp, P, mu_in, mu_out):
     return torch.nn.Sequential(in_bias, new_mlp, out_bias)
 
 # TODO - INLP functions store together with INLP code
-def get_rowspace_projection(W: np.ndarray) -> np.ndarray:
+def get_colspace_projection(W: np.ndarray) -> np.ndarray:
     """
     :param W: the matrix over its nullspace to project
     :return: the projection matrix over the rowspace
     """
 
     if np.allclose(W, 0):
-        w_basis = np.zeros_like(W.T)
+        w_basis = np.zeros_like(W)
     else:
-        w_basis = scipy.linalg.orth(W.T)  # orthogonal basis
+        w_basis = scipy.linalg.orth(W)  # orthogonal basis
 
+    print("Orthogonal basis size:", w_basis.shape)
     w_basis * np.sign(w_basis[0][0])  # handle sign ambiguity
     P_W = w_basis.dot(w_basis.T)  # orthogonal projection on W's rowspace
+
 
     return P_W
 
@@ -121,7 +125,7 @@ def execute_dama(
     l_vec_list = []
     r_vec_list = []
     for layer in sorted(hparams.layers):
-        for request in requests:
+        for request in tqdm(requests, desc=f"Gathering vectors for layer {layer}"):
             # Compute rank-1 update matrix
             left_vector: torch.Tensor = compute_u(
                 model,
@@ -163,39 +167,53 @@ def execute_dama(
         U_hat = np.matmul(V, np.linalg.pinv(W).T)
 
 
+        # rethink how it should be done ...
+
+        print("U shape:", U.shape)
+        print("U_hat shape:", U_hat.shape)
         # compute PLS mapping between U and U_hat
         print("Computing PLS mapping...")
         pls = PLSRegression(n_components=hparams.nullspace_dimension, scale=False)
         pls.fit(U, U_hat)
 
         print("Computing nullspace projection...")
-        B = pls.x_weights_[:,:hparams.nullspace_dimension] # not needed but maybe useful to get some statistics
-        P = np.eye(u_dim, u_dim) - get_rowspace_projection(B.T)
+
+        print("B shape:", pls.x_weights_.shape)
+        print(pls.x_weights_)
+        B = pls.x_weights_[:, :hparams.nullspace_dimension]  # not needed but maybe useful to get some statistics
+        # getting column space projections of B
+        M = np.eye(u_dim, u_dim) - get_colspace_projection(B)
 
         # TODO: maybe use global statistics to compute mu_s
         mu_in = pls._x_mean
         mu_out = W @ pls._x_mean
 
         print(f"Projections successfully computed for layer {list(projections.keys())}")
-        print(f"Projection values: {P}")
+        print(f"Nullspace projection values: {M}")
+
+        # getting eigenvalues of M
+        # M_eigenvalues = np.linalg.eigvals(M)
+        # print(f"Eigenvalues of M: {M_eigenvalues}")
+        # print(f"Number of non-zero eigenvalues of M: {np.sum(np.abs(M_eigenvalues) > 1e-6)}")
+
 
         ## Diff from identity matrix
-        print(f"Diff from identity matrix: {np.linalg.norm(P - np.eye(u_dim, u_dim))}")
+        print(f"Diff from identity matrix: {np.linalg.norm(M - np.eye(u_dim, u_dim))}")
         ### mu vectors
         print(f"Input centralization vector (mu_in): {mu_in}")
         print(f"Output de-centralization vector (mu_out): {mu_out}")
 
         # save as tensors
         if torch.cuda.is_available():
-            P = torch.tensor(P, dtype=torch.float16, device='cuda')
+            M = torch.tensor(M, dtype=torch.float16, device='cuda')
             mu_in = torch.tensor(mu_in, dtype=torch.float16, device='cuda')
             mu_out = torch.tensor(mu_out, dtype=torch.float16, device='cuda')
         else:
-            P = torch.tensor(P, dtype=torch.float32, device='cpu')
+            M = torch.tensor(M, dtype=torch.float32, device='cpu')
             mu_in = torch.tensor(mu_in, dtype=torch.float32, device='cpu')
             mu_out = torch.tensor(mu_out, dtype=torch.float32, device='cpu')
 
-        projections[module_name] = (P, mu_in, mu_out)
+        projections[module_name] = (M, mu_in, mu_out)
 
 
     # TODO: save projections
