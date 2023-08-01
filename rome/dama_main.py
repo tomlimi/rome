@@ -16,6 +16,7 @@ from .rome_hparams import DAMAHyperParams
 from .rome_main import get_context_templates
 
 from tqdm import tqdm
+import json
 
 class AddBias(torch.nn.Module):
     def __init__(self, bias):
@@ -63,6 +64,8 @@ def apply_dama_to_model(
     hparams: DAMAHyperParams,
     copy=False,
     return_orig_module=False,
+    projections_saveto=None,
+    projections_loadfrom=None,
 ) -> tuple[AutoModelForCausalLM | AutoModelForCausalLM, dict[str, Any]]:
 
     """
@@ -80,7 +83,21 @@ def apply_dama_to_model(
     module_copy = {}
 
     # Dama is applied for all requests together to improve generatlzation
-    projections = execute_dama(model, tok, requests, hparams)
+    if projections_loadfrom is not None:
+        print(f"Loading projections from {projections_loadfrom}")
+        loaded_projections = np.load(projections_loadfrom, allow_pickle=True).item()
+        if torch.cuda.is_available():
+            projections = { m_name: (torch.tensor(values['M'], device='cuda', dtype=torch.float16),
+                                     torch.tensor(values['mu_in'], device='cuda', dtype=torch.float16),
+                                     torch.tensor(values['mu_out'], device='cuda', dtype=torch.float16))
+                            for m_name, values in loaded_projections.items()}
+        else:
+            projections = {m_name: (torch.tensor(values['M'], device='cpu', dtype=torch.float32),
+                                    torch.tensor(values['mu_in'], device='cpu', dtype=torch.float32),
+                                    torch.tensor(values['mu_out'], device='cpu', dtype=torch.float32))
+                            for m_name, values in loaded_projections.items()}
+    else:
+        projections = execute_dama(model, tok, requests, hparams)
 
     with torch.no_grad():
         for m_name, (P, mu_in, mu_out) in projections.items():
@@ -95,6 +112,15 @@ def apply_dama_to_model(
 
         print(f"New weights successfully inserted into {list(projections.keys())}")
 
+    if projections_saveto is not None:
+        print(f"Saving projections to {projections_saveto}")
+        serializable_projections = {
+            m_name: {"M": M.cpu().numpy(), "mu_in": mu_in.cpu().numpy(),"mu_out": mu_out.cpu().numpy()}
+            for m_name, (M, mu_in, mu_out) in projections.items()}
+
+        np.save(projections_saveto, serializable_projections)
+        # with open(projections_saveto, "w") as f:
+        #     json.dump(serializable_projections, f, indent=4)
     return model, module_copy
 
 
