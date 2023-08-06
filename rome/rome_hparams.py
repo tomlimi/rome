@@ -43,6 +43,7 @@ class DAMAHyperParams(HyperParams):
     clamp_norm_factor: float
     kl_factor: float
     mom2_adjustment: bool
+    mom2_update_weight: int
     context_template_length_params: List[List[int]]
 
     # Module templates

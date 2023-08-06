@@ -10,13 +10,18 @@ import numpy as np
 import scipy
 from sklearn.cross_decomposition import PLSRegression
 
-from .compute_u import compute_u
-from .compute_v_dama import compute_v_dama
+from util.globals import *
+from .compute_us_dama import compute_us, get_module_input_output_at_words
+from .compute_v_dama import compute_v_dama, print_vs_stats
 from .rome_hparams import DAMAHyperParams
 from .rome_main import get_context_templates
+from rome import repr_tools
+from rome.layer_stats import layer_stats
 
 from tqdm import tqdm
 import json
+
+COV_CACHE = {}
 
 class AddBias(torch.nn.Module):
     def __init__(self, bias):
@@ -57,6 +62,7 @@ def get_colspace_projection(W: np.ndarray) -> np.ndarray:
 
     return P_W
 
+
 def apply_dama_to_model(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -66,6 +72,7 @@ def apply_dama_to_model(
     return_orig_module=False,
     projections_saveto=None,
     projections_loadfrom=None,
+    online_update=False,
 ) -> tuple[AutoModelForCausalLM | AutoModelForCausalLM, dict[str, Any]]:
 
     """
@@ -97,20 +104,21 @@ def apply_dama_to_model(
                                     torch.tensor(values['mu_out'], device='cpu', dtype=torch.float32))
                             for m_name, values in loaded_projections.items()}
     else:
-        projections = execute_dama(model, tok, requests, hparams)
+        projections = execute_dama(model, tok, requests, hparams, online_update=online_update)
 
-    with torch.no_grad():
-        for m_name, (P, mu_in, mu_out) in projections.items():
+    if not online_update:
+        with torch.no_grad():
+            for m_name, (P, mu_in, mu_out) in projections.items():
 
-            orig_module = nethook.get_module(model, m_name)
-            new_module = apply_dama_on_module(orig_module, P, mu_in, mu_out)
+                orig_module = nethook.get_module(model, m_name)
+                new_module = apply_dama_on_module(orig_module, P, mu_in, mu_out)
 
-            if return_orig_module and m_name not in module_copy:
-                module_copy[m_name] = deepcopy(orig_module)
+                if return_orig_module and m_name not in module_copy:
+                    module_copy[m_name] = deepcopy(orig_module)
 
-            nethook.replace_module(model, m_name, new_module)
+                nethook.replace_module(model, m_name, new_module)
 
-        print(f"New weights successfully inserted into {list(projections.keys())}")
+            print(f"New weights successfully inserted into {list(projections.keys())}")
 
     if projections_saveto is not None:
         print(f"Saving projections to {projections_saveto}")
@@ -129,6 +137,8 @@ def execute_dama(
         tok: AutoTokenizer,
         requests: Dict,
         hparams: DAMAHyperParams,
+        request_batch_size: int = 1.,
+        online_update: bool = False
 ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
 
     # # Retrieve weights that user desires to change
@@ -148,43 +158,102 @@ def execute_dama(
     # Update loop: sequentially intervene at each specified layer
     projections = {}
 
-    l_vec_list = []
-    r_vec_list = []
-    for layer in sorted(hparams.layers):
-        for request in tqdm(requests, desc=f"Gathering vectors for layer {layer}"):
-            # Compute rank-1 update matrix
-            left_vector: torch.Tensor = compute_u(
-                model,
-                tok,
-                request,
-                hparams,
-                layer,
-                get_context_templates(model, tok, hparams.context_template_length_params),
-            )
-            print("Left vector shape:", left_vector.shape)
-            l_vec_list.append(left_vector)
+    # compute v targets for each request
+    target_pos_list, target_neg_list = [], []
+    if request_batch_size > 1:
+        raise NotImplementedError("Batching not yet implemented")
+    else:
+        requests = [[request] for request in requests]
 
-            # compute v vectors for each PRONOUN option
-            right_contrast_vector: torch.Tensor = compute_v_dama(
+    # targets computed at the last layer
+    v_layer = hparams.layers[-1]
+    # for request in tqdm(requests, desc="Gathering targets from requests"):
+    #     targets = compute_v_dama(
+    #             model,
+    #             tok,
+    #             request,
+    #             hparams,
+    #             v_layer,
+    #             get_context_templates(model, tok, hparams.context_template_length_params),
+    #         )
+    #     target_pos_list.append(targets[0])
+    #     target_neg_list.append(targets[1])
+    #
+    # targets_pos = torch.stack(target_pos_list)
+    # targets_neg = torch.stack(target_neg_list)
+
+    req_contexts = [ request["prompt"] for request_batch in requests for request in request_batch]
+    req_words = [ request["subject"] for request_batch in requests for request in request_batch]
+
+    for layer in sorted(hparams.layers):
+        print(f"\n\nLAYER {layer}\n")
+
+        U = compute_us(model, tok, requests, hparams, layer,
+                              get_context_templates(model, tok, hparams.context_template_length_params))
+
+        v_list = []
+        for request in tqdm(requests, desc="Gathering targets from requests"):
+            targets = compute_v_dama(
                 model,
                 tok,
                 request,
                 hparams,
                 layer,
-                left_vector,
                 get_context_templates(model, tok, hparams.context_template_length_params),
+                compute_right_vector=True
             )
-            print("Right vector shape:", right_contrast_vector.shape)
-            r_vec_list.append(right_contrast_vector)
+            v_list.append(targets[0] - targets[1])
+
+        V = torch.stack(v_list)
+
+        # compute v targets for each request
+        # compute current value of v at last layer
+        # cur_vs = get_module_input_output_at_words(
+        #     model, tok, req_contexts, req_words, v_layer, hparams.rewrite_module_tmp, hparams.fact_token)[1]
+
+        # V_pos = targets_pos - cur_vs
+        # V_neg = targets_neg - cur_vs
+        # print_vs_stats(V_pos, V_neg, cur_vs)
+        #
+        # V = V_pos - V_neg
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+
+        # normalize contrast vectors
+        # V /= np.linalg.norm(V, axis=1, keepdims=True)
+        # From MEMIT paper
+        force_recompute = False
+        cov = get_cov(
+            model,
+            tok,
+            hparams.rewrite_module_tmp.format(layer),
+            hparams.mom2_dataset,
+            hparams.mom2_n_samples
+            if not force_recompute
+            else hparams.mom2_n_samples // 10,
+            hparams.mom2_dtype,
+            force_recompute=force_recompute,
+        )
+
+        if torch.cuda.is_available():
+            U = U.float()
+
+        print("Solving withening equation for U...")
+        U = torch.linalg.solve(
+            hparams.mom2_update_weight * cov + U.T @ U,
+            U.T
+        ).T
+
+        # V /= (len(hparams.layers) * hparams.mom2_update_weight)
+
+
         with torch.no_grad():
             module_name = f"{hparams.rewrite_module_tmp.format(layer)}"
             # detach the weights from the graph and convert to numpy (float32)
-            U = torch.stack(l_vec_list, dim=0).detach().cpu().numpy().astype(np.float32)
-            V = torch.stack(r_vec_list, dim=0).detach().cpu().numpy().astype(np.float32)
+            U = U.detach().cpu().numpy().astype(np.float32)
+            V = V.detach().cpu().numpy().astype(np.float32)
 
             W = weights[module_name].detach().cpu().numpy().astype(np.float32)
 
@@ -214,7 +283,6 @@ def execute_dama(
         mu_in = pls._x_mean
         mu_out = W @ pls._x_mean
 
-        print(f"Projections successfully computed for layer {list(projections.keys())}")
         print(f"Nullspace projection values: {M}")
 
         # getting eigenvalues of M
@@ -241,9 +309,55 @@ def execute_dama(
 
         projections[module_name] = (M, mu_in, mu_out)
 
+        if online_update:
+            with torch.no_grad():
 
-    # TODO: save projections
+                orig_module = nethook.get_module(model, module_name)
+                new_module = apply_dama_on_module(orig_module, M, mu_in, mu_out)
+
+                nethook.replace_module(model, module_name, new_module)
+
+            print(f"New weights successfully inserted into {list(projections.keys())}")
+
+
+    print(f"Projections successfully computed for layer {list(projections.keys())}")
     return projections
 
 
+def get_cov(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    layer_name: str,
+    mom2_dataset: str,
+    mom2_n_samples: str,
+    mom2_dtype: str,
+    inv: bool = False,
+    force_recompute: bool = False,
+) -> torch.Tensor:
+    """
+    Retrieves covariance statistics, then computes the algebraic inverse.
+    Caches result for future use.
+    """
 
+    model_name = model.config._name_or_path.replace("/", "_")
+    key = (model_name, layer_name)
+
+    print(f"Retrieving covariance statistics for {model_name} @ {layer_name}.")
+    if key not in COV_CACHE or force_recompute:
+        stat = layer_stats(
+            model,
+            tok,
+            layer_name,
+            STATS_DIR,
+            mom2_dataset,
+            to_collect=["mom2"],
+            sample_size=mom2_n_samples,
+            precision=mom2_dtype
+        )
+        COV_CACHE[key] = stat.mom2.moment().float().to("cpu")
+
+    if torch.cuda.is_available():
+        COV_CACHE[key] = COV_CACHE[key].to("cuda")
+    return (
+        torch.inverse(COV_CACHE[key]) if inv else COV_CACHE[key]
+    )

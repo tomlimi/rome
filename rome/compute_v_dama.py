@@ -17,16 +17,16 @@ from .rome_hparams import DAMAHyperParams
 LLAMA_PRONOUNS = {"pos": "he",
                  "neg": "she"}
 
-
+# TODO: Support request batching
 def compute_v_dama(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
-    request: Dict,
+    request: List[Dict],
     hparams: DAMAHyperParams,
     layer: int,
-    left_vector: torch.Tensor,
     context_templates: List[str],
-) -> torch.Tensor:
+    compute_right_vector: bool = False
+) -> [torch.Tensor, torch.Tensor]:
     """
     Computes the contrast value vector (`he` - `she`)for the projecting update.
     """
@@ -40,13 +40,13 @@ def compute_v_dama(
 
     # Compile list of rewriting and KL x/y pairs
     rewriting_prompts, kl_prompts = [
-        context.format(request["prompt"])
+        context.format(request[0]["prompt"])
         for context in context_templates
     ], ["<s> {} is a"]
     all_prompts = rewriting_prompts + kl_prompts
 
     input_tok= tok(
-        [prompt.format(request["subject"]) for prompt in all_prompts],
+        [prompt.format(request[0]["subject"]) for prompt in all_prompts],
         return_tensors="pt",
         padding=True,
         return_token_type_ids=False
@@ -59,9 +59,6 @@ def compute_v_dama(
         len(rewriting_prompts), *input_tok["input_ids"].shape[1:])
         for _ in ("pos", "neg") ]
 
-
-
-
     for i in range(len(rewriting_prompts)):
         ex_len = input_tok["attention_mask"][i].sum()
         rewriting_targetss[0][i, ex_len - len(target_idss[0]) : ex_len] = target_idss[0]
@@ -70,7 +67,7 @@ def compute_v_dama(
     # Compute indices of the tokens where the fact is looked up
     lookup_idxs = [
         find_fact_lookup_idx(
-            prompt, request["subject"], tok, hparams.fact_token, verbose=(i == 0)
+            prompt, request[0]["subject"], tok, hparams.fact_token, verbose=(i == 0)
         )
         for i, prompt in enumerate(all_prompts)
     ]
@@ -142,7 +139,7 @@ def compute_v_dama(
                 if kl_distr_init is None:
                     kl_distr_init = kl_log_probs.detach().clone()
 
-                # Compute loss on rewriting targets
+            # Compute loss on rewriting targets
             log_probs = torch.log_softmax(logits, dim=2)
 
             loss = torch.gather(
@@ -198,24 +195,30 @@ def compute_v_dama(
 
     # Retrieve cur_input, the current input to the 2nd MLP layer, and
     # cur_output, the original output of the 2nd MLP layer.
+
+    if not compute_right_vector:
+        return targets
+
     cur_input, cur_output = get_module_input_output_at_word(
         model,
         tok,
         layer,
-        context_template=request["prompt"],
-        word=request["subject"],
+        context_template=request[0]["prompt"],
+        word=request[0]["subject"],
         module_template=hparams.rewrite_module_tmp,
         fact_token_strategy=hparams.fact_token,
     )
 
     # Solving the linear system to compute the right vector
     # TODO: the next line doesn't really matter in DAME:
-    right_vectors = [(target - cur_output) / torch.dot(cur_input, left_vector) for target in targets]
-    print(f"Delta norms: {[(target - cur_output).norm().item() for target in targets]}")
-    print(
-        f"Change in target norms: {target_init.norm().item()} to {[target.norm().item() for target in targets]} => {[(target.norm() - target_init.norm()).item() for target in targets]}"
-    )
-    print(f"Division Factor: {torch.dot(cur_input, left_vector).item()}")
+    # right_vectors = [(target - cur_output) / torch.dot(cur_input, left_vector) for target in targets]
+    # print(f"Delta norms: {[(target - cur_output).norm().item() for target in targets]}")
+    # print(
+    #     f"Change in target norms: {target_init.norm().item()} to {[target.norm().item() for target in targets]} => {[(target.norm() - target_init.norm()).item() for target in targets]}"
+    # )
+    # print(f"Division Factor: {torch.dot(cur_input, left_vector).item()}")
+
+    right_vectors = [target - cur_output for target in targets]
     print(f"Right vector norms: {[right_vector.norm().item() for right_vector in right_vectors]}")
     print(f"Cosine between right vectors: {(torch.dot(right_vectors[0], right_vectors[1])/right_vectors[0].norm()/right_vectors[1].norm()).item()}")
     print(f"Cosine between deltas: {(torch.dot(deltas[0], deltas[1])/deltas[0].norm()/deltas[1].norm()).item()}")
@@ -225,10 +228,31 @@ def compute_v_dama(
     print(f"Cosine between contrast and positive vector: {(torch.dot(contrast_vector, right_vectors[0])/contrast_vector.norm()/right_vectors[0].norm()).item()}")
     print(f"Cosine between contrast and negative vector: {(torch.dot(contrast_vector, right_vectors[1])/contrast_vector.norm()/right_vectors[1].norm()).item()}")
 
+    return right_vectors
     # Compute contrast vector
-    contrast_vector = right_vectors[0] - right_vectors[1]
-    return contrast_vector
+    # contrast_vector = right_vectors[0] - right_vectors[1]
+    # return contrast_vector
 
+
+def print_vs_stats(V_pos, V_neg, V_orig):
+
+    V_contrast = V_pos - V_neg
+
+
+    print(f"Positive vector norms: {[v.norm().item() for v in torch.unbind(V_pos)]}")
+    print(f"Negative vector norms: {[v.norm().item() for v in torch.unbind(V_neg)]}")
+    print(f"Contrast vector norms: {[v.norm().item() for v in torch.unbind(V_contrast)]}")
+    print(f"Value vector norms: {[v.norm().item() for v in torch.unbind(V_orig)]}")
+
+    print(f"Cosine across contrast vectors: {((V_contrast @ V_contrast.T)/(V_contrast.norm(dim=1, keepdim=True)*V_contrast.norm(dim=1, keepdim=True).T))}")
+
+    print(f"Cosine between contrast and original vector: {[(torch.dot(v_contrast, v_orig.T)/(v_contrast.norm()*v_orig.norm())).item() for v_contrast, v_orig in zip(torch.unbind(V_contrast), torch.unbind(V_orig))]}")
+
+    print(f"Cosine between pos and original vector: {[(torch.dot(v_pos, v_orig.T)/(v_pos.norm()*v_orig.norm())).item() for v_pos, v_orig in zip(torch.unbind(V_pos), torch.unbind(V_orig))]}")
+    print(f"Cosine between neg and original vector: {[(torch.dot(v_neg, v_orig.T)/(v_neg.norm()*v_orig.norm())).item() for v_neg, v_orig in zip(torch.unbind(V_neg), torch.unbind(V_orig))]}")
+    print(f"Cosine between pos and neg vector: {[((v_pos @ v_neg.T)/(v_pos.norm()*v_neg.norm())).item() for v_pos, v_neg in zip(torch.unbind(V_pos), torch.unbind(V_neg))]}")
+
+    print("\n*******\n")
 
 def get_module_input_output_at_word(
     model: AutoModelForCausalLM,
