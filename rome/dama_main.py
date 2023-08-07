@@ -317,7 +317,7 @@ def execute_dama(
 
                 nethook.replace_module(model, module_name, new_module)
 
-            print(f"New weights successfully inserted into {list(projections.keys())}")
+            print(f"New weights successfully inserted into {module_name}.")
 
 
     print(f"Projections successfully computed for layer {list(projections.keys())}")
